@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Pan, rotate, zoom the 3D viewport and scroll any UI/menu with multitouch (Windows).",
@@ -39,6 +39,10 @@ if IS_WINDOWS:
     # Wheel / window-walking constants
     WM_MOUSEWHEEL = 0x020A
     GA_ROOT = 2
+
+    # mouse_event flags for injecting a real held left-button press.
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP   = 0x0004
 
     class POINT(ctypes.Structure):
         _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
@@ -122,6 +126,14 @@ if IS_WINDOWS:
         user32.GetCurrentThreadId = ctypes.windll.kernel32.GetCurrentThreadId
         user32.GetCurrentThreadId.restype = wintypes.DWORD
 
+        # For injecting a real held left-button press during button/gizmo drags.
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.SetCursorPos.restype = wintypes.BOOL
+        user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD,
+                                       wintypes.DWORD, wintypes.DWORD,
+                                       ctypes.POINTER(ctypes.c_ulong)]
+        user32.mouse_event.restype = None
+
         TOUCH_API_AVAILABLE = True
     except (AttributeError, OSError):
         TOUCH_API_AVAILABLE = False
@@ -174,6 +186,7 @@ class GestureState:
         self.mode = None            # 'view3d' | 'scroll' | None — locked at gesture start
         self.view3d_target = None   # (area, region, rv3d) when mode == 'view3d'
         self.wheel_accum = 0.0      # accumulated sub-notch wheel delta in scroll mode
+        self.last_inject_xy = None  # last (x, y) where we injected a held click
 
     def reset_baseline(self):
         self.prev_centroid = self._centroid()
@@ -391,6 +404,31 @@ def post_mouse_wheel(screen_x, screen_y, delta_signed, modifiers=0):
     user32.PostMessageW(top, WM_MOUSEWHEEL, wparam, lparam)
 
 
+def _inject_left_down(screen_x, screen_y):
+    """Move the real cursor to (screen_x, screen_y) and press the left mouse
+    button down, leaving it held. Used to start a hold-drag on a gizmo/button."""
+    if not (IS_WINDOWS and TOUCH_API_AVAILABLE):
+        return
+    user32.SetCursorPos(int(screen_x), int(screen_y))
+    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, None)
+
+
+def _inject_move(screen_x, screen_y):
+    """Move the real cursor while the left button is held, so Blender sees a
+    drag that follows the finger."""
+    if not (IS_WINDOWS and TOUCH_API_AVAILABLE):
+        return
+    user32.SetCursorPos(int(screen_x), int(screen_y))
+
+
+def _inject_left_up(screen_x, screen_y):
+    """Release the held left mouse button at (screen_x, screen_y)."""
+    if not (IS_WINDOWS and TOUCH_API_AVAILABLE):
+        return
+    user32.SetCursorPos(int(screen_x), int(screen_y))
+    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, None)
+
+
 # ---------------------------------------------------------------------------
 # WH_GETMESSAGE hook — captures WM_POINTER* on the GUI thread
 # ---------------------------------------------------------------------------
@@ -560,8 +598,10 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
             self._state.update_point(ev["pid"], ev["x"], ev["y"],
                                      ev["down"], ev["up"])
 
-        # Gesture ended? reset mode.
+        # Gesture ended? reset mode. (Windows releases the synthesised left
+        # button automatically when the finger lifts, so no manual up needed.)
         if not self._state.points:
+            self._state.last_inject_xy = None
             self._state.end_gesture()
             if self._hook is not None:
                 self._hook.passthrough[0] = False
@@ -587,9 +627,11 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
             area, region, _local = target
             rtype = region.type
 
-            # Regions that are button strips → passthrough (taps click buttons).
-            _BUTTON_REGIONS = {'TOOLS', 'TOOL_PROPS', 'NAVIGATION_BAR',
-                               'HEADER', 'FOOTER', 'TAB', 'EXECUTE'}
+            # Regions that are button strips → passthrough (hold-drag clicks).
+            # NOTE: TOOLS (left toolbar) is intentionally NOT here — it is
+            # scrollable, so it falls through to 'scroll' mode below.
+            _BUTTON_REGIONS = {'NAVIGATION_BAR', 'HEADER', 'FOOTER',
+                               'TAB', 'EXECUTE'}
             # Regions that are scrollable panel content → scroll on drag.
             _SCROLL_REGIONS = {'UI', 'CHANNELS', 'WINDOW'}
 
@@ -616,7 +658,11 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
                 # Properties editor, N-panel, outliner, etc.: scroll on drag.
                 self._state.begin_gesture('scroll')
 
-            # Tell the input hook whether to let clicks through for this gesture.
+            # For passthrough gestures (gizmo/button hold-drag) let Windows'
+            # own touch-to-mouse synthesis through: a held touch produces a
+            # real left-button-DOWN at touch start and UP at lift, which is
+            # exactly the hold-drag we want. We just follow the finger with
+            # the cursor each tick (below) so Blender drags the handle.
             if self._hook is not None:
                 self._hook.passthrough[0] = (self._state.mode == 'passthrough')
 
@@ -626,8 +672,10 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
         pan_dx, pan_dy, zoom, rot_dx, rot_dy, n = delta
 
         if self._state.mode == 'passthrough':
-            # Touch is on a gizmo/button inside the viewport — do nothing and
-            # let Blender process the click normally.
+            # Hold-drag: Windows is holding the left button down for the touch;
+            # we just move the cursor to follow the finger so Blender drags the
+            # gizmo/handle/button under it. Released automatically on finger lift.
+            _inject_move(int(cx), int(cy))
             return {'PASS_THROUGH'}
 
         if self._state.mode == 'view3d':
