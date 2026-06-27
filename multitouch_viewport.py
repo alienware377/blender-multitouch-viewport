@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Pan, rotate, zoom the 3D viewport and scroll any UI/menu with multitouch (Windows).",
@@ -21,6 +21,11 @@ IS_WINDOWS = sys.platform.startswith("win")
 # Module-level constant (used in scroll-mode pixel-to-wheel conversion).
 WHEEL_DELTA = 120
 SCROLL_PIXELS_PER_NOTCH = 30.0  # how many vertical pixels of drag = one wheel notch
+
+# Signature stamped into dwExtraInfo of OUR injected mouse events, so the input
+# hook can recognise them (via GetMessageExtraInfo) and let them through while
+# still suppressing Windows' own touch-synthesised clicks.
+_INJECT_SIG = 0x5113CA75
 
 if IS_WINDOWS:
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -125,6 +130,9 @@ if IS_WINDOWS:
 
         user32.GetCurrentThreadId = ctypes.windll.kernel32.GetCurrentThreadId
         user32.GetCurrentThreadId.restype = wintypes.DWORD
+
+        user32.GetMessageExtraInfo.argtypes = []
+        user32.GetMessageExtraInfo.restype = wintypes.LPARAM
 
         # For injecting a real held left-button press during button/gizmo drags.
         user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -319,12 +327,14 @@ def find_area_under_cursor(screen_x, screen_y, window):
     return None
 
 
-# Approx. size of the navigate gizmo cluster (zoom/pan/camera/persp + the
-# view-axis ball) in the top-right of every 3D viewport, in pixels. Touches
-# inside this zone should click the gizmo, not orbit the view.
+# The navigate gizmo cluster (axis ball + zoom/pan/camera/persp/grid mini
+# buttons) sits at the top-right of the VISIBLE viewport. When the N-panel
+# (UI region) or any other side region is open it overlaps the WINDOW region,
+# so the gizmo is drawn shifted LEFT by that sidebar's width. We account for
+# that here, and use a tall/wide enough zone to cover every stacked button.
 def _in_navigate_gizmo_zone(area, region, local_x, local_y):
-    """True if (local_x, local_y) falls in the top-right navigation gizmo
-    cluster of a VIEW_3D WINDOW region."""
+    """True if (local_x, local_y) falls in the navigation gizmo cluster of a
+    VIEW_3D WINDOW region, accounting for an overlapping right sidebar."""
     try:
         prefs = bpy.context.preferences
         if not prefs.view.show_navigate_ui:
@@ -332,16 +342,30 @@ def _in_navigate_gizmo_zone(area, region, local_x, local_y):
         ui_scale = prefs.system.ui_scale
     except Exception:
         ui_scale = 1.0
-    # Gizmo cluster spans roughly the top-right ~80px wide and ~220px tall
-    # (axis ball + 4-5 mini buttons stacked below), scaled by UI scale.
-    zone_w = 80.0 * ui_scale
-    zone_h = 230.0 * ui_scale
+
+    # Find the width of any region that overlaps the WINDOW region on the RIGHT
+    # (the N-panel/UI sidebar). The gizmo is drawn to the left of it.
+    right_inset = 0
+    try:
+        for r in area.regions:
+            if r.type == 'UI' and r.width > 1:
+                # UI sidebar is anchored to the right edge of the area.
+                right_inset = r.width
+                break
+    except Exception:
+        right_inset = 0
+
+    # Zone: wide enough for the mini buttons, tall enough for ball + 5 buttons.
+    zone_w = 95.0 * ui_scale
+    zone_h = 460.0 * ui_scale
+
     rx = local_x - region.x
     ry = local_y - region.y
-    # region-local: x from right edge, y from top edge
-    from_right = region.width - rx
+    # Distance from the right edge of the *visible* viewport (sidebar excluded).
+    from_right = (region.width - right_inset) - rx
     from_top = region.height - ry
-    return (0 <= from_right <= zone_w) and (0 <= from_top <= zone_h)
+    # A little negative tolerance so touches right at the gizmo's left/edge count.
+    return (-8 <= from_right <= zone_w) and (-8 <= from_top <= zone_h)
 
 
 
@@ -413,12 +437,32 @@ def _inject_left_down(screen_x, screen_y):
     user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, None)
 
 
+def _inject_left_down(screen_x, screen_y):
+    """Move the real cursor to the point and press+hold the left mouse button.
+    We drive the click ourselves because the touch-synth button-down is
+    suppressed by our hook before the gesture is classified as passthrough."""
+    if not (IS_WINDOWS and TOUCH_API_AVAILABLE):
+        return
+    user32.SetCursorPos(int(screen_x), int(screen_y))
+    extra = ctypes.c_ulong(_INJECT_SIG)
+    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, ctypes.byref(extra))
+
+
 def _inject_move(screen_x, screen_y):
     """Move the real cursor while the left button is held, so Blender sees a
     drag that follows the finger."""
     if not (IS_WINDOWS and TOUCH_API_AVAILABLE):
         return
     user32.SetCursorPos(int(screen_x), int(screen_y))
+
+
+def _inject_left_up(screen_x, screen_y):
+    """Release the held left mouse button at the given screen point."""
+    if not (IS_WINDOWS and TOUCH_API_AVAILABLE):
+        return
+    user32.SetCursorPos(int(screen_x), int(screen_y))
+    extra = ctypes.c_ulong(_INJECT_SIG)
+    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, ctypes.byref(extra))
 
 
 def _inject_left_up(screen_x, screen_y):
@@ -479,7 +523,15 @@ class TouchHook:
                     # mouse messages Windows auto-generates from touch — UNLESS
                     # the current gesture is a button/toolbar/gizmo passthrough,
                     # in which case let the click reach Blender so it registers.
-                    if touch_count[0] > 0 and m in _SYNTH and not _passthrough[0]:
+                    is_ours = False
+                    if m in _SYNTH:
+                        try:
+                            xinfo = user32.GetMessageExtraInfo()
+                            is_ours = (int(xinfo) & 0xFFFFFFFF) == _INJECT_SIG
+                        except Exception:
+                            is_ours = False
+                    if (touch_count[0] > 0 and m in _SYNTH
+                            and not _passthrough[0] and not is_ours):
                         msg.message = 0x0000  # WM_NULL — Blender ignores it
                         # Still let CallNextHookEx run so other hooks are unaffected.
 
@@ -598,9 +650,11 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
             self._state.update_point(ev["pid"], ev["x"], ev["y"],
                                      ev["down"], ev["up"])
 
-        # Gesture ended? reset mode. (Windows releases the synthesised left
-        # button automatically when the finger lifts, so no manual up needed.)
+        # Gesture ended? release our injected button (if any), then reset mode.
         if not self._state.points:
+            if self._state.mode == 'passthrough' and self._state.last_inject_xy:
+                ix, iy = self._state.last_inject_xy
+                _inject_left_up(ix, iy)
             self._state.last_inject_xy = None
             self._state.end_gesture()
             if self._hook is not None:
@@ -658,13 +712,17 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
                 # Properties editor, N-panel, outliner, etc.: scroll on drag.
                 self._state.begin_gesture('scroll')
 
-            # For passthrough gestures (gizmo/button hold-drag) let Windows'
-            # own touch-to-mouse synthesis through: a held touch produces a
-            # real left-button-DOWN at touch start and UP at lift, which is
-            # exactly the hold-drag we want. We just follow the finger with
-            # the cursor each tick (below) so Blender drags the handle.
+            # Keep the hook SUPPRESSING Windows' own touch-synth clicks (the
+            # initial synth button-down is eaten before we classify the gesture
+            # anyway). For passthrough we drive a clean, controlled left-button
+            # press OURSELVES at the touch point, hold it through the drag, and
+            # release on lift — this reliably clicks gizmo/header buttons and
+            # drags gizmo handles.
             if self._hook is not None:
-                self._hook.passthrough[0] = (self._state.mode == 'passthrough')
+                self._hook.passthrough[0] = False
+            if self._state.mode == 'passthrough':
+                _inject_left_down(int(cx), int(cy))
+                self._state.last_inject_xy = (int(cx), int(cy))
 
         delta = self._state.consume_delta()
         if delta is None:
@@ -672,10 +730,11 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
         pan_dx, pan_dy, zoom, rot_dx, rot_dy, n = delta
 
         if self._state.mode == 'passthrough':
-            # Hold-drag: Windows is holding the left button down for the touch;
-            # we just move the cursor to follow the finger so Blender drags the
-            # gizmo/handle/button under it. Released automatically on finger lift.
+            # Hold-drag: our injected left button is held; move the cursor to
+            # follow the finger so Blender drags the gizmo/handle (or simply
+            # holds on a button until release for a clean click).
             _inject_move(int(cx), int(cy))
+            self._state.last_inject_xy = (int(cx), int(cy))
             return {'PASS_THROUGH'}
 
         if self._state.mode == 'view3d':
