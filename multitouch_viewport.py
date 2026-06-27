@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Pan, rotate, zoom the 3D viewport and scroll any UI/menu with multitouch (Windows).",
@@ -275,9 +275,15 @@ def _screen_to_local(window, screen_x, screen_y):
 
 # Region type priority for hit-testing. WINDOW first so that e.g. the View3D
 # main region wins over an overlapping header strip.
+# Overlapping side/header regions are checked BEFORE 'WINDOW'. In Blender the
+# TOOLS (left toolbar), UI (right sidebar/N-panel), HEADER, etc. are drawn on
+# top of the WINDOW region and share its pixel bounds, so if WINDOW is tested
+# first every toolbar touch wrongly resolves to the viewport (orbit). Listing
+# WINDOW LAST means a touch only counts as 'viewport' when it's in the actual
+# empty 3D area, not over a panel/toolbar/header drawn above it.
 _REGION_PRIORITY = (
-    'WINDOW', 'UI', 'TOOLS', 'TOOL_PROPS', 'CHANNELS',
-    'PREVIEW', 'NAVIGATION_BAR', 'EXECUTE', 'HEADER', 'FOOTER',
+    'UI', 'TOOLS', 'TOOL_PROPS', 'CHANNELS', 'NAVIGATION_BAR',
+    'EXECUTE', 'HEADER', 'FOOTER', 'PREVIEW', 'WINDOW',
 )
 
 
@@ -298,6 +304,32 @@ def find_area_under_cursor(screen_x, screen_y, window):
                         region.y <= local_y <= region.y + region.height):
                     return area, region, (local_x - region.x, local_y - region.y)
     return None
+
+
+# Approx. size of the navigate gizmo cluster (zoom/pan/camera/persp + the
+# view-axis ball) in the top-right of every 3D viewport, in pixels. Touches
+# inside this zone should click the gizmo, not orbit the view.
+def _in_navigate_gizmo_zone(area, region, local_x, local_y):
+    """True if (local_x, local_y) falls in the top-right navigation gizmo
+    cluster of a VIEW_3D WINDOW region."""
+    try:
+        prefs = bpy.context.preferences
+        if not prefs.view.show_navigate_ui:
+            return False
+        ui_scale = prefs.system.ui_scale
+    except Exception:
+        ui_scale = 1.0
+    # Gizmo cluster spans roughly the top-right ~80px wide and ~220px tall
+    # (axis ball + 4-5 mini buttons stacked below), scaled by UI scale.
+    zone_w = 80.0 * ui_scale
+    zone_h = 230.0 * ui_scale
+    rx = local_x - region.x
+    ry = local_y - region.y
+    # region-local: x from right edge, y from top edge
+    from_right = region.width - rx
+    from_top = region.height - ry
+    return (0 <= from_right <= zone_w) and (0 <= from_top <= zone_h)
+
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +413,11 @@ class TouchHook:
         # Count of fingers currently touching. Shared between the filter
         # and the capture logic inside hook_proc below.
         touch_count = [0]
+        # When True, the current gesture is over a button/toolbar/gizmo, so
+        # the filter lets synthesised clicks through (don't suppress them).
+        # The modal operator flips self._hook.passthrough[0] as gestures begin.
+        self.passthrough = [False]
+        _passthrough = self.passthrough
 
         # Synthesised mouse messages Windows generates from touch contacts.
         # We replace these with WM_NULL (0x0000) while any finger is down so
@@ -401,8 +438,10 @@ class TouchHook:
                     m = msg.message
 
                     # While any finger is on the screen, suppress the
-                    # mouse messages Windows auto-generates from touch.
-                    if touch_count[0] > 0 and m in _SYNTH:
+                    # mouse messages Windows auto-generates from touch — UNLESS
+                    # the current gesture is a button/toolbar/gizmo passthrough,
+                    # in which case let the click reach Blender so it registers.
+                    if touch_count[0] > 0 and m in _SYNTH and not _passthrough[0]:
                         msg.message = 0x0000  # WM_NULL — Blender ignores it
                         # Still let CallNextHookEx run so other hooks are unaffected.
 
@@ -524,6 +563,8 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
         # Gesture ended? reset mode.
         if not self._state.points:
             self._state.end_gesture()
+            if self._hook is not None:
+                self._hook.passthrough[0] = False
             return {'PASS_THROUGH'}
 
         c = self._state._centroid()
@@ -544,16 +585,50 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
                 self._state.reset_baseline()
                 return {'PASS_THROUGH'}
             area, region, _local = target
-            if area.type == 'VIEW_3D' and region.type == 'WINDOW':
-                rv3d = area.spaces.active.region_3d
-                self._state.begin_gesture('view3d', (area, region, rv3d))
+            rtype = region.type
+
+            # Regions that are button strips → passthrough (taps click buttons).
+            _BUTTON_REGIONS = {'TOOLS', 'TOOL_PROPS', 'NAVIGATION_BAR',
+                               'HEADER', 'FOOTER', 'TAB', 'EXECUTE'}
+            # Regions that are scrollable panel content → scroll on drag.
+            _SCROLL_REGIONS = {'UI', 'CHANNELS', 'WINDOW'}
+
+            if area.type == 'VIEW_3D' and rtype == 'WINDOW':
+                # Inside the 3D viewport proper. Check the gizmo cluster first.
+                local_xy = None
+                for window in context.window_manager.windows:
+                    lx, ly = _screen_to_local(window, int(cx), int(cy))
+                    if (area.x <= lx <= area.x + area.width and
+                            area.y <= ly <= area.y + area.height):
+                        local_xy = (lx, ly)
+                        break
+                if local_xy is not None and _in_navigate_gizmo_zone(
+                        area, region, local_xy[0], local_xy[1]):
+                    self._state.begin_gesture('passthrough')
+                else:
+                    rv3d = area.spaces.active.region_3d
+                    self._state.begin_gesture('view3d', (area, region, rv3d))
+            elif rtype in _BUTTON_REGIONS:
+                # Toolbars, headers, tool-tabs: taps should click, so pass
+                # synthesised clicks through and do no scrolling.
+                self._state.begin_gesture('passthrough')
             else:
+                # Properties editor, N-panel, outliner, etc.: scroll on drag.
                 self._state.begin_gesture('scroll')
+
+            # Tell the input hook whether to let clicks through for this gesture.
+            if self._hook is not None:
+                self._hook.passthrough[0] = (self._state.mode == 'passthrough')
 
         delta = self._state.consume_delta()
         if delta is None:
             return {'PASS_THROUGH'}
         pan_dx, pan_dy, zoom, rot_dx, rot_dy, n = delta
+
+        if self._state.mode == 'passthrough':
+            # Touch is on a gizmo/button inside the viewport — do nothing and
+            # let Blender process the click normally.
+            return {'PASS_THROUGH'}
 
         if self._state.mode == 'view3d':
             target = self._state.view3d_target
@@ -658,8 +733,12 @@ class VIEW3D_PT_multitouch(bpy.types.Panel):
         box.label(text="  • 2 fingers drag → pan")
         box.label(text="  • 2 fingers pinch → zoom")
         box.separator()
-        box.label(text="Anywhere else (panels, menus):")
+        box.label(text="Panels & sidebars:")
         box.label(text="  • drag → scroll")
+        box.label(text="  • tap → click button")
+        box.separator()
+        box.label(text="Toolbars & gizmo buttons:")
+        box.label(text="  • tap → click")
 
         layout.separator()
         layout.prop(props, "scroll_fingers", expand=True)
