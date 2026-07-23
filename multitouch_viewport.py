@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (1, 9, 0),
+    "version": (2, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Pan, rotate, zoom the 3D viewport and scroll any UI/menu with multitouch (Windows).",
@@ -207,10 +207,6 @@ class GestureState:
         self.view3d_target = None   # (area, region, rv3d) when mode == 'view3d'
         self.wheel_accum = 0.0      # accumulated sub-notch wheel delta in scroll mode
         self.last_inject_xy = None  # last (x, y) where we injected a held click
-        self.gizmo_ball = None      # (area, lx, ly) when touch started on axis ball
-        self.gizmo_btn = None       # 'zoom'|'pan'|'camera'|'persp' mini-button
-        self.tap_start = None       # screen (x, y) at gesture start, for tap detection
-        self.moved = False          # set True once the gesture moves beyond a threshold
 
     def reset_baseline(self):
         self.prev_centroid = self._centroid()
@@ -225,10 +221,6 @@ class GestureState:
         self.mode = None
         self.view3d_target = None
         self.wheel_accum = 0.0
-        self.gizmo_ball = None
-        self.gizmo_btn = None
-        self.tap_start = None
-        self.moved = False
 
     def update_point(self, pid, x, y, is_down, is_up):
         if is_up:
@@ -347,110 +339,6 @@ def find_area_under_cursor(screen_x, screen_y, window):
     return None
 
 
-# The navigate gizmo cluster (axis ball + zoom/pan/camera/projection mini-
-# buttons) sits at the top-right of the VISIBLE viewport. Blender's gizmo does
-# NOT respond to synthesised mouse clicks, so instead of faking clicks we detect
-# WHICH sub-button a touch is on and call the matching view operator directly.
-#
-# Layout, top to bottom (per the Blender manual "Navigation Gizmo"):
-#   axis ball  -> tap a dot = snap to that axis; drag = orbit
-#   zoom       -> view3d.zoom
-#   pan        -> view3d.view_pan
-#   camera     -> view3d.view_camera
-#   projection -> view3d.view_persportho
-#
-# Everything is expressed as fractions of g = (gizmo_size * ui_scale) measured
-# from the gizmo's top-right anchor, so it stays correct across screen size,
-# DPI / UI-scale, aspect ratio, and right-sidebar width.
-
-def _gizmo_metrics(area):
-    """(anchor_x, anchor_y, g, region) in WINDOW-region-local coords (y-up).
-    anchor is the top-RIGHT corner of the gizmo cluster."""
-    prefs = bpy.context.preferences
-    try:
-        ui_scale = prefs.system.ui_scale
-    except Exception:
-        ui_scale = 1.0
-    try:
-        gizmo_size = prefs.view.gizmo_size_navigate_v3d or 80
-    except Exception:
-        gizmo_size = 80
-    g = gizmo_size * ui_scale
-
-    region = None
-    for r in area.regions:
-        if r.type == 'WINDOW':
-            region = r
-            break
-    right_inset = 0
-    for r in area.regions:
-        if r.type == 'UI' and r.width > 1:
-            right_inset = r.width
-            break
-    margin = 0.25 * g
-    anchor_x = (region.width - right_inset) - margin
-    anchor_y = region.height - margin
-    return anchor_x, anchor_y, g, region
-
-
-def _classify_gizmo_hit(area, local_x, local_y):
-    """WINDOW-region-local (rx, ry) → which gizmo part, or None.
-    Returns 'ball' | 'zoom' | 'pan' | 'camera' | 'persp' | None."""
-    try:
-        prefs = bpy.context.preferences
-        if not prefs.view.show_navigate_ui:
-            return None
-    except Exception:
-        pass
-    anchor_x, anchor_y, g, region = _gizmo_metrics(area)
-
-    dx = anchor_x - local_x   # 0 at right edge, grows leftward
-    dy = anchor_y - local_y   # 0 at top edge, grows downward
-
-    if dx < -0.18 * g or dx > 1.18 * g:
-        return None
-    if dy < -0.18 * g:
-        return None
-
-    if dy <= 1.0 * g:
-        return 'ball'
-
-    btn_zone = dy - 1.0 * g
-    idx = int(btn_zone // (0.5 * g))
-    names = ['zoom', 'pan', 'camera', 'persp']
-    if 0 <= idx < len(names):
-        return names[idx]
-    return None
-
-
-def _ball_axis(area, local_x, local_y):
-    """For a tap on the axis ball, return the view3d.view_axis type to snap to
-    based on which side of the ball centre the tap is, or None for the centre
-    (which should orbit, not snap)."""
-    anchor_x, anchor_y, g, region = _gizmo_metrics(area)
-    cx = anchor_x - 0.5 * g          # ball centre x
-    cy = anchor_y - 0.5 * g          # ball centre y
-    ddx = local_x - cx
-    ddy = local_y - cy
-    r = (ddx * ddx + ddy * ddy) ** 0.5
-    # Centre dead-zone → orbit, not snap.
-    if r < 0.18 * g:
-        return None
-    import math as _m
-    ang = _m.degrees(_m.atan2(ddy, ddx))  # 0=right(+X area), 90=up
-    # The gizmo dots: +X right, -X left, +Y up-left, -Y, +Z up, -Z down area.
-    # Simplify to the 4 cardinal screen directions → front/back/right/left,
-    # plus up/down → top/bottom is ambiguous on the ball; use nearest dot.
-    # Map by angle octant.
-    if -45 <= ang <= 45:
-        return 'RIGHT'      # +X to the right
-    if 45 < ang <= 135:
-        return 'TOP'        # up = +Z
-    if ang > 135 or ang < -135:
-        return 'LEFT'       # -X
-    return 'BOTTOM'         # down = -Z
-
-
 # ---------------------------------------------------------------------------
 # Viewport / wheel actuators
 # ---------------------------------------------------------------------------
@@ -508,22 +396,6 @@ def post_mouse_wheel(screen_x, screen_y, delta_signed, modifiers=0):
     # LPARAM: HIWORD = screen y, LOWORD = screen x.
     lparam = ((int(screen_y) & 0xFFFF) << 16) | (int(screen_x) & 0xFFFF)
     user32.PostMessageW(top, WM_MOUSEWHEEL, wparam, lparam)
-
-
-def _run_view_op(area, region, op_name, **kwargs):
-    """Call a view3d operator with a proper context override on the given area.
-    Returns True on success."""
-    try:
-        rv3d = area.spaces.active.region_3d
-        with bpy.context.temp_override(window=bpy.context.window,
-                                       area=area, region=region,
-                                       region_data=rv3d):
-            getattr(bpy.ops.view3d, op_name)(**kwargs)
-        area.tag_redraw()
-        return True
-    except Exception as e:
-        _log("  OP %s failed: %s" % (op_name, e))
-        return False
 
 
 def _inject_left_down(screen_x, screen_y):
@@ -729,27 +601,8 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
             self._state.update_point(ev["pid"], ev["x"], ev["y"],
                                      ev["down"], ev["up"])
 
-        # Gesture ended? Fire any tap action, release injected button, reset.
+        # Gesture ended? Release injected button, reset mode.
         if not self._state.points:
-            # Axis-ball TAP (no significant movement) → snap to that axis.
-            if (self._state.gizmo_ball is not None and not self._state.moved):
-                area, blx, bly = self._state.gizmo_ball
-                axis = _ball_axis(area, blx, bly)
-                if axis is not None:
-                    region = next((r for r in area.regions if r.type == 'WINDOW'), None)
-                    _log("  BALL tap → view_axis %s" % axis)
-                    _run_view_op(area, region, 'view_axis', type=axis)
-            # Mini-button TAP for camera / persp toggles.
-            if (self._state.gizmo_btn in ('camera', 'persp') and not self._state.moved):
-                target = self._state.view3d_target
-                if target is not None:
-                    area, region, _rv = target
-                    if self._state.gizmo_btn == 'camera':
-                        _log("  BTN tap → view_camera")
-                        _run_view_op(area, region, 'view_camera')
-                    else:
-                        _log("  BTN tap → view_persportho")
-                        _run_view_op(area, region, 'view_persportho')
             if self._state.mode == 'passthrough' and self._state.last_inject_xy:
                 ix, iy = self._state.last_inject_xy
                 _inject_left_up(ix, iy)
@@ -781,38 +634,9 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
             rtype = region.type
 
             if area.type == 'VIEW_3D' and rtype == 'WINDOW':
-                # Inside the 3D viewport proper. Resolve window-local coords so
-                # we can test the navigation-gizmo cluster.
-                local_xy = None
-                for window in context.window_manager.windows:
-                    lx, ly = _screen_to_local(window, int(cx), int(cy))
-                    if (area.x <= lx <= area.x + area.width and
-                            area.y <= ly <= area.y + area.height):
-                        local_xy = (lx, ly)
-                        break
-                # WINDOW-region-local coords for gizmo classification.
-                hit = None
-                if local_xy is not None:
-                    # Convert window-local → WINDOW-region-local for the gizmo
-                    # classifier (its anchor is measured from region.width).
-                    rlx = local_xy[0] - region.x
-                    rly = local_xy[1] - region.y
-                    hit = _classify_gizmo_hit(area, rlx, rly)
+                # Inside the 3D viewport → orbit / pan / zoom.
                 rv3d = area.spaces.active.region_3d
-                if hit == 'ball':
-                    # Axis ball: orbit on drag, snap-to-axis on tap. Store the
-                    # region-local touch point so _ball_axis can map the tap.
-                    self._state.begin_gesture('view3d', (area, region, rv3d))
-                    self._state.gizmo_ball = (area, rlx, rly)
-                    self._state.tap_start = (int(cx), int(cy))
-                elif hit in ('zoom', 'pan', 'camera', 'persp'):
-                    # Mini-button: fire its operator. zoom/pan are drag controls;
-                    # camera/persp are toggles (fire once on tap-release).
-                    self._state.begin_gesture('gizmo', (area, region, rv3d))
-                    self._state.gizmo_btn = hit
-                    self._state.tap_start = (int(cx), int(cy))
-                else:
-                    self._state.begin_gesture('view3d', (area, region, rv3d))
+                self._state.begin_gesture('view3d', (area, region, rv3d))
             elif rtype in ('NAVIGATION_BAR', 'HEADER', 'FOOTER', 'TAB', 'EXECUTE'):
                 # Header / nav-bar / tabs: these ARE normal Blender buttons that
                 # do respond to synth clicks (unlike the gizmo), so use the
@@ -824,11 +648,8 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
 
             if self._hook is not None:
                 self._hook.passthrough[0] = False
-            _log("GESTURE start mode=%s region=%s area=%s hit=%s at=(%d,%d)" % (
-                self._state.mode, rtype, area.type,
-                getattr(self._state, 'gizmo_btn', None) or
-                ('ball' if getattr(self._state,'gizmo_ball',None) else '-'),
-                int(cx), int(cy)))
+            _log("GESTURE start mode=%s region=%s area=%s at=(%d,%d)" % (
+                self._state.mode, rtype, area.type, int(cx), int(cy)))
             if self._state.mode == 'passthrough':
                 _inject_left_down(int(cx), int(cy))
                 self._state.last_inject_xy = (int(cx), int(cy))
@@ -837,41 +658,6 @@ class VIEW3D_OT_multitouch_navigate(bpy.types.Operator):
         if delta is None:
             return {'PASS_THROUGH'}
         pan_dx, pan_dy, zoom, rot_dx, rot_dy, n = delta
-
-        # Track whether the gesture has moved beyond a small threshold (used to
-        # distinguish a tap from a drag for the gizmo ball / mini-buttons).
-        if self._state.tap_start is not None:
-            sdx = int(cx) - self._state.tap_start[0]
-            sdy = int(cy) - self._state.tap_start[1]
-            if (sdx * sdx + sdy * sdy) > (12 * 12):
-                self._state.moved = True
-
-        if self._state.mode == 'gizmo':
-            # zoom/pan are drag controls; camera/persp are toggles fired on tap
-            # release (handled in the gesture-end block). For zoom/pan we apply
-            # continuously as the finger drags.
-            target = self._state.view3d_target
-            if target is None:
-                return {'PASS_THROUGH'}
-            area, region, rv3d = target
-            btn = self._state.gizmo_btn
-            if btn == 'zoom':
-                # Vertical drag → zoom. Reuse apply_gesture's zoom path.
-                if abs(pan_dy) > 0.01 or abs(rot_dy) > 0.01:
-                    dy = pan_dy if n >= 2 else rot_dy
-                    factor = 1.0 + (-dy / 200.0)
-                    apply_gesture(rv3d, region, 0, 0, factor, 0, 0)
-                    try: area.tag_redraw()
-                    except ReferenceError: self._state.end_gesture()
-            elif btn == 'pan':
-                dx = pan_dx if n >= 2 else rot_dx
-                dy = pan_dy if n >= 2 else rot_dy
-                if dx or dy:
-                    apply_gesture(rv3d, region, dx, dy, 1.0, 0, 0)
-                    try: area.tag_redraw()
-                    except ReferenceError: self._state.end_gesture()
-            # camera / persp: do nothing here; fire on release.
-            return {'PASS_THROUGH'}
 
         if self._state.mode == 'passthrough':
             # Hold-drag: our injected left button is held; move the cursor to
@@ -994,7 +780,7 @@ class VIEW3D_PT_multitouch(bpy.types.Panel):
         box.label(text="  • drag → scroll")
         box.label(text="  • tap → click button")
         box.separator()
-        box.label(text="Toolbars & gizmo buttons:")
+        box.label(text="Toolbars & headers:")
         box.label(text="  • tap → click")
 
         layout.separator()
